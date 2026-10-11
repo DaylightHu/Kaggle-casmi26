@@ -1,0 +1,39 @@
+data_dir: /root/autodl-tmp/data
+work_dir: work
+seed: 20261011
+preprocess:
+  top_n: 96
+  intensity_floor: 0.001
+  remove_precursor: true
+  precursor_exclusion_da: 0.5
+  max_precursor_error_ppm: 50.0
+fingerprint:
+  bits: 2048
+  radius: 2
+retrieval:
+  mass_ppm: 15.0
+  mass_da: 0.003
+  fallback_ppm: 50.0
+  fallback_da: 0.02
+  fragment_da: 0.02
+  fragment_ppm: 10.0
+  max_references_per_structure: 24
+  max_candidates: 5000
+  top_k: 25
+  fp_weight_strong: 0.35
+  fp_weight_weak: 0.80
+training:
+  batch_size: 256
+  epochs: 12
+  steps_per_epoch: 1500
+  views_per_molecule: 4
+  workers: 2
+  embedding_dim: 192
+  hidden_dim: 512
+  bin_width: 0.1
+  max_mz: 1500.0
+  dropout: 0.15
+  peak_dropout: 0.10
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  amp: true
