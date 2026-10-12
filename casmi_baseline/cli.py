@@ -110,6 +110,13 @@ def export_assets(config, dest, checkpoint=None, wheelhouse=None):
         raise ValueError("Export directory must be outside work_dir")
     if dest.exists() and any(dest.iterdir()):
         raise FileExistsError("Export directory must be empty")
+    # Check required source files before copying the potentially large cache.
+    required_files = (ROOT / "requirements.txt", ROOT / "kaggle/infer.py", ROOT / "casmi_baseline/__init__.py")
+    missing = [str(path) for path in required_files if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Cannot export assets; missing required source files: " + ", ".join(missing))
+    if wheelhouse and not Path(wheelhouse).is_dir():
+        raise FileNotFoundError("Wheelhouse directory does not exist: " + str(wheelhouse))
     if checkpoint:
         from .fingerprint import load_checkpoint
         payload = load_checkpoint(checkpoint)
@@ -122,8 +129,14 @@ def export_assets(config, dest, checkpoint=None, wheelhouse=None):
     shutil.copytree(source_work / "cache", dest / "cache")
     if (source_work / "candidates/manifest.json").exists():
         shutil.copytree(source_work / "candidates", dest / "candidates")
-    for filename in ("requirements.txt", "README.md", "SOURCES.md"):
-        shutil.copy2(ROOT / filename, dest / filename)
+    shutil.copy2(ROOT / "requirements.txt", dest / "requirements.txt")
+    # Documentation is useful, but its absence must not interrupt inference export.
+    for filename in ("README.md", "SOURCES.md"):
+        source = ROOT / filename
+        if source.is_file():
+            shutil.copy2(source, dest / filename)
+        else:
+            print("Optional documentation not found; skipping:", filename)
     shutil.copy2(ROOT / "kaggle/infer.py", dest / "infer.py")
     exported_config = config.copy()
     exported_config["work_dir"] = "."
