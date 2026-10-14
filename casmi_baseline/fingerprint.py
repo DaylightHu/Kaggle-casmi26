@@ -199,6 +199,63 @@ def validation_bce(model, cache, rows, model_config, device, batch_size):
     return total / count
 
 
+class FingerprintRankingValidation:
+    """Select a bag encoder by deduplicated molecule MRR in diversity retrieval."""
+
+    def __init__(self, config, cache, split, model, device, info, frequencies):
+        from .candidates import CandidatePool
+        from .chemistry import scorer_key
+        from .diversity import DiverseRanker
+
+        predictor = FingerprintPredictor.__new__(FingerprintPredictor)
+        predictor.model = model
+        predictor.model_config = model.model_config
+        predictor.device = device
+        predictor.training_info = info
+        pool = CandidatePool(cache, Path(config["work_dir"]) / "candidates")
+        self.ranker = DiverseRanker(config, cache, pool, device=str(device),
+                                   blocked_sids=split["held_sids"],
+                                   blocked_rows=split["blocked_rows"])
+        self.ranker.bags = [predictor]
+        self.ranker.prior = np.asarray(frequencies, dtype=np.float32)
+        grouped = {}
+        for row in split["query_rows"]:
+            sid = int(cache.meta["sid"][row])
+            grouped.setdefault(sid, []).append(query_from_cache(cache, row))
+        self.items = [(scorer_key(cache.structures.iloc[sid]["smiles"]), queries)
+                      for sid, queries in grouped.items()]
+        if not self.items:
+            raise ValueError("Validation split contains no query molecules")
+        self.keys = {}
+
+    @torch.inference_mode()
+    def evaluate(self):
+        from .chemistry import scorer_key
+
+        self.ranker.bags[0].model.eval()
+        scores, covered = [], []
+        for truth, queries in tqdm(self.items, desc="fingerprint molecule validation"):
+            ranked, _ = self.ranker.rank_queries(queries)
+            seen, rank, score, found = set(), 0, 0.0, False
+            for smiles in ranked["smiles"]:
+                if smiles not in self.keys:
+                    self.keys[smiles] = scorer_key(smiles)
+                key = self.keys[smiles]
+                if key in seen:
+                    continue
+                seen.add(key)
+                rank += 1
+                if key == truth:
+                    found = True
+                    score = 1.0 / rank if rank <= 25 else 0.0
+                    break
+            scores.append(score)
+            covered.append(found)
+        return {"mrr_at_25": float(np.mean(scores)),
+                "candidate_coverage": float(np.mean(covered)),
+                "molecules": len(scores), "scenario": "no-reference"}
+
+
 def train_fingerprint(config, split_path=None, full=False, device="auto", batch_size=None,
                       epochs=None, steps_per_epoch=None, output_dir=None, resume=None, allow_mismatch=False):
     # This function is intentionally reachable only via an explicit train-fingerprint command.
@@ -208,10 +265,13 @@ def train_fingerprint(config, split_path=None, full=False, device="auto", batch_
     if version != cache.manifest["rdkit"]:
         raise ValueError("RDKit differs from cache")
     cfg = config["training"].copy()
+    # No implicit cap, even when an older YAML still contains steps_per_epoch: 1500.
+    # The existing CLI can pass a positive cap explicitly for a short trial.
+    cfg["steps_per_epoch"] = 0 if steps_per_epoch is None else steps_per_epoch
     for name, value in [("batch_size", batch_size), ("epochs", epochs), ("steps_per_epoch", steps_per_epoch)]:
         if value is not None:
             cfg[name] = value
-    if min(cfg["batch_size"], cfg["epochs"], cfg["steps_per_epoch"], cfg["views_per_molecule"]) < 1:
+    if min(cfg["batch_size"], cfg["epochs"], cfg["views_per_molecule"]) < 1 or cfg["steps_per_epoch"] < 0:
         raise ValueError("Training sizes must be positive")
     if not full and split_path is None:
         split_path = Path(config["work_dir"]) / "validation/split.json"
@@ -232,7 +292,7 @@ def train_fingerprint(config, split_path=None, full=False, device="auto", batch_
     loader = DataLoader(dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=cfg["workers"],
                         collate_fn=collate, pin_memory=device.type == "cuda", worker_init_fn=seed_worker,
                         generator=torch.Generator().manual_seed(seed), drop_last=False)
-    steps = min(cfg["steps_per_epoch"], len(loader))
+    steps = min(cfg["steps_per_epoch"], len(loader)) if cfg["steps_per_epoch"] else len(loader)
     model = SpectrumFingerprintNet(model_config).to(device)
     # Count only training identities; validation fingerprint frequencies are never used to initialise the model.
     frequencies = np.zeros(config["fingerprint"]["bits"], dtype=np.float64)
@@ -252,8 +312,9 @@ def train_fingerprint(config, split_path=None, full=False, device="auto", batch_
     split_hash = None if full else file_digest(split_path)
     training_info = {"full": bool(full), "split_sha256": split_hash, "held_keys": [] if full else split["held_keys"],
                      "training_structures": int(len(dataset.sids)), "seed": seed,
-                     "partial_cache": cache.manifest["partial_cache"]}
-    start_epoch, best, history = 0, float("inf"), []
+                     "partial_cache": cache.manifest["partial_cache"],
+                     "selection_metric": "diversity_no_reference_mrr_at_25"}
+    start_epoch, best, best_bce, history = 0, -1.0, float("inf"), []
     if resume:
         previous = load_checkpoint(resume)
         for key, expected in [("model_config", model_config), ("training_info", training_info), ("training_config", cfg)]:
@@ -264,7 +325,8 @@ def train_fingerprint(config, split_path=None, full=False, device="auto", batch_
         scheduler.load_state_dict(previous["scheduler"])
         scaler.load_state_dict(previous["scaler"])
         start_epoch = previous["epoch"]
-        best = previous["best_validation_bce"] if previous["best_validation_bce"] is not None else float("inf")
+        best = previous["best_validation_mrr"] if previous["best_validation_mrr"] is not None else -1.0
+        best_bce = previous["best_validation_bce"] if previous["best_validation_bce"] is not None else float("inf")
         history = previous["history"]
         torch.set_rng_state(previous["torch_rng"])
         if previous.get("cuda_rng") is not None and device.type == "cuda":
@@ -274,6 +336,8 @@ def train_fingerprint(config, split_path=None, full=False, device="auto", batch_
         np.random.set_state((rng[0], np.asarray(rng[1], dtype=np.uint32), rng[2], rng[3], rng[4]))
         random.setstate(previous["python_rng"])
     val_rows = [] if full else split["query_rows"][:2000]
+    ranking_validation = None if full else FingerprintRankingValidation(
+        config, cache, split, model, device, training_info, frequencies)
     print(f"Explicit training: device={device}, AMP={amp}, batch={cfg['batch_size']}, structures={len(dataset.sids)}, steps/epoch={steps}")
     for epoch in range(start_epoch, cfg["epochs"]):
         model.train()
@@ -300,19 +364,24 @@ def train_fingerprint(config, split_path=None, full=False, device="auto", batch_
             total += float(loss.detach()) * len(target)
             seen += len(target)
         val = validation_bce(model, cache, val_rows, model_config, device, cfg["batch_size"])
+        ranking = None if full else ranking_validation.evaluate()
         record = {"epoch": epoch+1, "train_loss": total/max(seen, 1), "validation_bce": val,
+                  "validation": ranking, "steps": steps, "training_views": seen,
                   "cuda_peak_allocated_gb": torch.cuda.max_memory_allocated(device)/2**30 if device.type == "cuda" else 0.0}
         history.append(record)
-        improved = val is not None and val < best
+        improved = ranking is not None and ranking["mrr_at_25"] > best
         if improved:
-            best = val
+            best = ranking["mrr_at_25"]
+        if val is not None:
+            best_bce = min(best_bce, val)
         nrng = np.random.get_state()
         payload = {"format_version": 1, "model": model.state_dict(), "model_config": model_config,
                    "training_info": training_info, "training_config": cfg, "adducts": cache.manifest["adducts"],
                    "fingerprint": cache.manifest["fingerprint"], "preprocess": cache.manifest["preprocess"],
                    "rdkit": version, "epoch": epoch+1, "optimizer": optimizer.state_dict(),
                    "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(), "history": history,
-                   "best_validation_bce": None if not np.isfinite(best) else best,
+                   "best_validation_bce": None if not np.isfinite(best_bce) else best_bce,
+                   "best_validation_mrr": None if best < 0 else best,
                    "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
                    "loader_rng": loader.generator.get_state(), "python_rng": random.getstate(),
                    "numpy_rng": [nrng[0], nrng[1].tolist(), int(nrng[2]), int(nrng[3]), float(nrng[4])]}
