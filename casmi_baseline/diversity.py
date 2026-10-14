@@ -65,15 +65,16 @@ def key_digest(table):
 def descriptor(smiles):
     from rdkit import Chem, DataStructs
     from rdkit.Chem import MACCSkeys, rdMolDescriptors
-    mol = Chem.MolFromSmiles(smiles)
     maccs = np.zeros(MACCS_BITS, dtype=np.uint8)
     path = np.zeros(PATH_BITS, dtype=np.uint8)
-    DataStructs.ConvertToNumpyArray(MACCSkeys.GenMACCSKeys(mol), maccs)
-    DataStructs.ConvertToNumpyArray(Chem.RDKFingerprint(mol, fpSize=PATH_BITS), path)
     counts = np.zeros(len(ELEMENTS), dtype=np.uint16)
-    for element, count in re.findall(r'([A-Z][a-z]?)(\d*)', rdMolDescriptors.CalcMolFormula(mol)):
-        index = ELEMENTS.index(element) if element in ELEMENTS else len(ELEMENTS) - 1
-        counts[index] += int(count or '1')
+    mol = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) else None
+    if mol is not None and mol.GetNumAtoms():
+        DataStructs.ConvertToNumpyArray(MACCSkeys.GenMACCSKeys(mol), maccs)
+        DataStructs.ConvertToNumpyArray(Chem.RDKFingerprint(mol, fpSize=PATH_BITS), path)
+        for element, count in re.findall(r'([A-Z][a-z]?)(\d*)', rdMolDescriptors.CalcMolFormula(mol)):
+            index = ELEMENTS.index(element) if element in ELEMENTS else len(ELEMENTS) - 1
+            counts[index] += int(count or '1')
     return np.packbits(maccs, bitorder='little'), np.packbits(path, bitorder='little'), counts
 
 
@@ -190,7 +191,11 @@ def import_worker(item):
     if not minimum <= rdMolDescriptors.CalcExactMolWt(mol) <= maximum:
         return 'outside_mass_range', None
     try:
-        return 'valid', describe_structure(smiles, **fp_config)
+        record, fp = describe_structure(smiles, **fp_config)
+        restored = Chem.MolFromSmiles(record['smiles'])
+        if restored is None or not restored.GetNumAtoms():
+            return 'invalid', None
+        return 'valid', (record, fp)
     except (ValueError, RuntimeError, KeyError):
         return 'invalid', None
 
