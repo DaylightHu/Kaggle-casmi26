@@ -25,6 +25,7 @@
 | 外部结构库 | 导入 CSV/Parquet/SMILES，重算质量和指纹，按评分结构键去重 | 否 |
 | 指纹模型 | 峰与中性丢失的加权 EmbeddingBag + 元数据 MLP → 2048 位 Morgan 指纹 | **是，可选** |
 | 结构排序 | 谱库分数 + 可选预测指纹相似度 + 少量质量一致性先验 | 否 |
+| GLACIER 前向谱重排 | 冻结公开权重预测候选谱；独立做谱相似度、跨谱聚合和同分子式置信门控 | 否（冻结权重） |
 | 验证 | 整个评分结构身份留出；或天然产物 timsTOF 面板上的两种检索场景 | 否 |
 | 提交检查 | ID 完整性、空值、重复、25 候选上限、SMILES 有效性及等价候选重复 | 否 |
 
@@ -272,6 +273,7 @@ subprocess.check_call([
 | `casmi_baseline/candidates.py` | 外部结构导入和质量召回 |
 | `casmi_baseline/retrieval.py` | 多谱聚合、排序和提交 |
 | `casmi_baseline/fingerprint.py` | 可选模型、训练、恢复及推理 |
+| `casmi_baseline/glacier.py` | 冻结 GLACIER 前向谱、独立谱评分与安全重排 |
 | `casmi_baseline/validation.py` | 评分身份留出、天然产物面板 |
 | `casmi_baseline/metric.py` | MRR@25 和提交检查 |
 | `casmi_baseline/cli.py` | 命令行入口 |
@@ -290,7 +292,53 @@ subprocess.check_call([
 
 若质量窗口没有候选，程序先扩大窗口；仍无候选时返回最近质量结构以避免空提交，并记录 `nearest_outside_window`。这只是格式兜底，**不是新结构发现**，应优先扩大结构库覆盖或检查加合物换算。
 
-## 10. 测试与实际验证范围
+## 10. GLACIER 独立前向谱重排
+
+`casmi_baseline.glacier` 以完整 DreaMS-head 工作目录为基线，只把公开
+`casmi26-glacier` 资源中的固定 GLACIER 权重、固定 `ms-pred` 源码子集和兼容层作为前向模型。
+它不导入资源中的 `gl_runner.py` 或 `gl_fuse.py`，候选截取、重复预测消除、谱相似度、跨谱聚合和融合均由本项目实现。
+所有会执行的外部文件及 checkpoint 都按 SHA256 白名单验证。
+
+先验证手动下载的目录：
+
+```bash
+cd /root/autodl-tmp/casmi26-baseline
+
+python -m pip install 'einops>=0.8,<1' 'platformdirs>=4,<5'
+
+python -m casmi_baseline.glacier check-bundle \
+  --bundle /root/autodl-tmp/data/casmi26-glacier
+```
+
+然后令 `BASE_ASSETS` 指向已经产生 0.219 提交的完整工作目录；它必须含有
+`config.yaml`、`cache/`、`candidates/`、`diversity/`、`analog/`、`dreams/` 和
+`models/dreams_head.pt`：
+
+```bash
+BASE_ASSETS=/root/autodl-tmp/casmi26-dreams-head-assets
+
+python -m casmi_baseline.glacier \
+  --config "$BASE_ASSETS/config.yaml" \
+  --data-dir /root/autodl-tmp/data \
+  --work-dir "$BASE_ASSETS" \
+  predict \
+  --test-path /root/autodl-tmp/data/test.parquet \
+  --bundle /root/autodl-tmp/data/casmi26-glacier \
+  --devices 0,1 \
+  --base-device cuda \
+  --top-candidates 64 \
+  --glacier-batch-size 8 \
+  --glacier-workers 2 \
+  --runtime-dir /root/autodl-tmp/glacier-work \
+  --output /root/autodl-tmp/submission008.csv
+```
+
+默认只覆盖正离子 `[M+H]+` / `[M+Na]+`，并只在原有分子式槽位内重排；弱证据不改变基线。
+同一候选的相同加合物、仪器和 5 eV 能量桶只做一次模型前向，再分别与重复实验谱比较。
+任何分片失败或超时都保留已完成结果，完全无 GLACIER 结果时输出顺序与基线一致。
+同时写出 `submission008.base.csv` 作为本次运行的 0.219 基线对照，以及候选和诊断 JSON；正式提交只用 `submission008.csv`。
+
+## 11. 测试与实际验证范围
 
 ```bash
 python -m pip install pytest
