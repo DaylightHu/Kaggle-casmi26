@@ -34,6 +34,7 @@ from tqdm import tqdm
 
 from . import diversity, dreams_head
 from .common import ROOT, file_digest, load_config, read_json, write_json
+from .chemistry import scorer_key
 from .metric import check_submission
 from .retrieval import build_queries
 from .spectra import mean_energy
@@ -354,7 +355,7 @@ class GlacierRuntime:
         from ms_pred import common
 
         payload = torch.load(checkpoint, map_location='cpu', weights_only=True)
-        if set(payload) != {'hyper_parameters', 'state_dict'}:
+        if not {'hyper_parameters', 'state_dict'}.issubset(payload):
             raise ValueError('Expected a stripped {hyper_parameters, state_dict} GLACIER checkpoint.')
         if len(payload['state_dict']) != CHECKPOINT_TENSORS:
             raise ValueError('Unexpected number of GLACIER state tensors.')
@@ -531,7 +532,10 @@ def unique_candidates(frame, limit):
     seen = set()
     rows = []
     for index, row in frame.iterrows():
-        key = str(row['key'])
+        try:
+            key = scorer_key(str(row['smiles']))
+        except (ValueError, RuntimeError):
+            continue
         if key in seen:
             continue
         seen.add(key)
